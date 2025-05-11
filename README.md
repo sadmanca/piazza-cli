@@ -3,6 +3,8 @@ A command line tool for Piazza
 
 # Interactive Piazza CLI
 
+![Demo](assets/output.gif)
+
 This project provides an interactive, color-rich command-line interface to Piazza using the unofficial piazza-api.
 
 ## Setup
