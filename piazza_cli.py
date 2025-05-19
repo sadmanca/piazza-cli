@@ -131,7 +131,7 @@ class PiazzaCLI(Cmd):
             # Otherwise, loop back to courses
 
     def do_courses(self, arg):
-        """Interactively select a course and view questions (arrow keys, Enter to select). Press [q] to exit, [h] for help, [l] to logout."""
+        """Interactively select a course and view questions (arrow keys, Enter to select). Press [q] to exit, [h] for help, [l] to logout, [s] to search."""
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
             progress.add_task(description="Fetching courses...", total=None)
             self.courses = self.piazza.get_user_classes()
@@ -159,6 +159,7 @@ class PiazzaCLI(Cmd):
                 course_labels.append("[n] Next Page")
             if total_pages > 1 and page > 0:
                 course_labels.append("[p] Previous Page")
+            course_labels.append("[s] Search")
             course_labels.append("[q] Quit")
             course_labels.append("[h] Help")
             course_labels.append("[l] Logout")
@@ -194,6 +195,21 @@ class PiazzaCLI(Cmd):
             if choice == "[p] Previous Page":
                 page -= 1
                 continue
+            if choice == "[s] Search":
+                # Prompt for course to search in
+                if not page_courses:
+                    continue
+                course_search_labels = [f"{c['name']} [{c['term']}]" for c in page_courses]
+                course_search_choice = questionary.select(
+                    "Select a course to search in:",
+                    choices=course_search_labels + ["Back"]
+                ).ask()
+                if course_search_choice == "Back" or course_search_choice is None:
+                    continue
+                selected_idx = course_search_labels.index(course_search_choice)
+                selected_course = page_courses[selected_idx]
+                self._search_in_course(selected_course)
+                continue
             if choice in course_labels:
                 selected_idx = course_labels.index(choice)
                 if selected_idx < len(page_courses):
@@ -201,6 +217,36 @@ class PiazzaCLI(Cmd):
                     console.print(Panel(f"Selected course: [bold green]{self.current_course['name']}[/bold green] ({self.current_course['term']})", style="bold white on dark_green", expand=False))
                     self._question_list_view()
             # Otherwise, loop again
+
+    def _search_in_course(self, course):
+        """Prompt for a search query and show results for the selected course."""
+        net = self.piazza.network(course['nid'])
+        query = questionary.text("Enter search query:").ask()
+        if not query:
+            return
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
+            progress.add_task(description="Searching posts...", total=None)
+            results = net.search_feed(query)
+        # Handle both dict-with-feed and list return types
+        if isinstance(results, dict) and 'feed' in results:
+            posts = results['feed']
+        elif isinstance(results, list):
+            posts = results
+        else:
+            posts = []
+        if not posts:
+            console.print("[yellow]No results found.[/yellow]")
+            input("Press Enter to return...")
+            return
+        post_labels = [f"[{p['nr']}] {p.get('subject', '')}" for p in posts]
+        post_labels.append("Back")
+        while True:
+            choice = questionary.select(f"Search results in {course['name']}:", choices=post_labels).ask()
+            if choice is None or choice == "Back":
+                break
+            idx = post_labels.index(choice)
+            post_nr = posts[idx]['nr']
+            self._show_post(post_nr, net)
 
     def _question_list_view(self):
         """Show a scrollable list of questions for the selected course. Enter to view discussion."""
