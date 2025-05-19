@@ -12,7 +12,6 @@ from rich.text import Text
 from rich.syntax import Syntax
 import questionary
 from rich import box
-import msvcrt
 from rich.align import Align
 from rich.console import Group
 from rich.live import Live
@@ -113,8 +112,26 @@ class PiazzaCLI(Cmd):
             table.add_row(cmd_name, doc)
         console.print(Panel(table, border_style="bright_blue", title="Commands", title_align="left"))
 
+    def cmdloop(self, intro=None):
+        # Override to always show courses as the main menu
+        while True:
+            if not self.logged_in:
+                self._main_menu()
+                continue
+            exit_flag = self.do_courses("")
+            if exit_flag == 'exit':
+                self.do_exit("")
+                break
+            elif exit_flag == 'logout':
+                self.do_logout("")
+                break
+            elif exit_flag == 'help':
+                self.do_help("")
+                continue
+            # Otherwise, loop back to courses
+
     def do_courses(self, arg):
-        """Interactively select a course and view questions (arrow keys, Enter to select)."""
+        """Interactively select a course and view questions (arrow keys, Enter to select). Press [q] to exit, [h] for help, [l] to logout."""
         with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True) as progress:
             progress.add_task(description="Fetching courses...", total=None)
             self.courses = self.piazza.get_user_classes()
@@ -129,19 +146,61 @@ class PiazzaCLI(Cmd):
                 return (int(parts[1]), term_order[parts[0]])
             return (0, 0)
         sorted_courses = sorted(self.courses, key=term_key, reverse=True)
-        course_labels = [f"{c['name']} [{c['term']}]" for c in sorted_courses]
-        course_labels.append("Cancel")
-        choice = questionary.select("Select a Course:", choices=course_labels).ask()
-        if choice is None or choice == "Cancel":
-            console.print("[yellow]No course selected.[/yellow]")
-            return
-        selected_idx = course_labels.index(choice)
-        if selected_idx is not None:
-            self.current_course = sorted_courses[selected_idx]
-            console.print(Panel(f"Selected course: [bold green]{self.current_course['name']}[/bold green] ({self.current_course['term']})", style="bold white on dark_green", expand=False))
-            self._question_list_view()
-        else:
-            console.print("[yellow]No course selected.[/yellow]")
+        PAGE_SIZE = 30
+        page = 0
+        total_pages = (len(sorted_courses) + PAGE_SIZE - 1) // PAGE_SIZE
+        while True:
+            start = page * PAGE_SIZE
+            end = start + PAGE_SIZE
+            page_courses = sorted_courses[start:end]
+            course_labels = [f"{c['name']} [{c['term']}]" for c in page_courses]
+            # Add navigation and utility options
+            if total_pages > 1 and page < total_pages - 1:
+                course_labels.append("[n] Next Page")
+            if total_pages > 1 and page > 0:
+                course_labels.append("[p] Previous Page")
+            course_labels.append("[q] Quit")
+            course_labels.append("[h] Help")
+            course_labels.append("[l] Logout")
+            # Remove shortcut_key_map, just use use_shortcuts=True
+            choice = questionary.select(
+                "Select a Course:",
+                choices=course_labels,
+                qmark="[piazza]",
+                use_shortcuts=True
+            ).ask()
+            if choice is None:
+                continue
+            if choice == "[q] Quit":
+                confirm = questionary.confirm("Are you sure you want to quit?", default=False).ask()
+                if confirm:
+                    sys.exit(0)
+                else:
+                    continue
+            if choice == "[h] Help":
+                self.do_help("")
+                input("Press Enter to return to the course list...")
+                continue
+            if choice == "[l] Logout":
+                confirm = questionary.confirm("Are you sure you want to logout?", default=False).ask()
+                if confirm:
+                    self.do_logout("")
+                    sys.exit(0)
+                else:
+                    continue
+            if choice == "[n] Next Page":
+                page += 1
+                continue
+            if choice == "[p] Previous Page":
+                page -= 1
+                continue
+            if choice in course_labels:
+                selected_idx = course_labels.index(choice)
+                if selected_idx < len(page_courses):
+                    self.current_course = page_courses[selected_idx]
+                    console.print(Panel(f"Selected course: [bold green]{self.current_course['name']}[/bold green] ({self.current_course['term']})", style="bold white on dark_green", expand=False))
+                    self._question_list_view()
+            # Otherwise, loop again
 
     def _question_list_view(self):
         """Show a scrollable list of questions for the selected course. Enter to view discussion."""
