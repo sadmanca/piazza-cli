@@ -2,6 +2,17 @@ import os
 import sys
 import json
 import getpass
+import time # Added for caching
+try:
+    from sentence_transformers import SentenceTransformer
+    from sentence_transformers import util
+    import torch # Often a dependency for sentence-transformers
+    SENTENCE_TRANSFORMERS_AVAILABLE = True
+except ImportError:
+    SENTENCE_TRANSFORMERS_AVAILABLE = False
+
+import dateutil.parser # For parsing timestamps
+
 from piazza_api import Piazza
 from cmd import Cmd
 from rich.console import Console
@@ -18,7 +29,6 @@ from rich.live import Live
 import keyboard
 from rich.markdown import Markdown
 import re
-import time # Added for caching timestamp
 
 CRED_FILE = os.path.expanduser("~/.piazza_cli_creds.json")
 console = Console()
@@ -35,15 +45,6 @@ except ImportError:
     # Fallback: strip tags, no formatting
     def html_to_markdown(html):
         return re.sub('<[^<]+?>', '', html or '')
-
-# Imports for semantic search
-try:
-    from sentence_transformers import SentenceTransformer, util
-    import torch
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENTENCE_TRANSFORMERS_AVAILABLE = False
-    # We'll handle the absence of the library in the search method
 
 # Global cache for posts and embeddings
 POST_CACHE = {}
@@ -510,50 +511,137 @@ class PiazzaCLI(Cmd):
                 prefix.append("[FOLLOWUP] ", style="yellow")
             elif role == 'comment':
                 prefix.append("[COMMENT] ", style="dim")
+            elif role == 'note': # Added role for 'note' type posts
+                prefix.append("[NOTE] ", style="bold cyan")
             
-            from rich.padding import Padding # This was correctly placed in user's _show_post
+            from rich.padding import Padding 
             rendered_elements = []
             
             if str(prefix):
                 rendered_elements.append(Padding(prefix, (0, 0, 0, indent * 4)))
 
-            current_body_parts = []
-            subject_text = entry.get('subject')
-            if subject_text:
-                current_body_parts.append(f"**{subject_text.strip()}**")
+            # 1. Author and Timestamp
+            author_line_parts = []
+            display_name = None
+            created_ts = None 
 
-            html_content_str = entry.get('content', '')
+            if role == 'op' and 'history' in entry and entry['history']:
+                op_info = entry['history'][0]
+                if op_info.get('anon') == 'no' and 'uid' in op_info: # uid might be name or need lookup
+                    display_name = op_info['uid'] 
+                elif op_info.get('anon', 'no') != 'no': 
+                    display_name = f"Anonymous ({op_info.get('anon')})" if op_info.get('anon') else "Anonymous"
+                created_ts = op_info.get('created')
+            else: 
+                if 'name' in entry: 
+                    display_name = entry['name']
+                elif 'anon_name' in entry and entry['anon_name'] and entry['anon_name'] != "Anonymous": 
+                    display_name = entry['anon_name']
+                elif 'uid' in entry and not display_name: 
+                    if isinstance(entry['uid'], str) and '@' not in entry['uid'] and '.' not in entry['uid']:
+                        display_name = entry['uid']
+                if not display_name and entry.get('anon', 'no') != 'no':
+                     display_name = f"Anonymous ({entry.get('anon')})" if entry.get('anon') else "Anonymous"
+                elif not display_name: 
+                    display_name = "User" 
+                created_ts = entry.get('created')
+
+            if display_name:
+                author_line_parts.append(Text(str(display_name), style="italic dim"))
+
+            if created_ts:
+                try:
+                    dt_obj = dateutil.parser.parse(created_ts)
+                    author_line_parts.append(Text(f" ({dt_obj.strftime('%b %d, %Y, %I:%M %p')})", style="dim"))
+                except Exception: 
+                    author_line_parts.append(Text(f" ({created_ts})", style="dim"))
+            
+            if author_line_parts:
+                author_text = Text.assemble(*author_line_parts)
+                rendered_elements.append(Padding(author_text, (0, 0, 0, (indent * 4) + 2 )))
+
+            # 2. Subject (Title for OP)
+            subject_str = None
+            if role == 'op' and 'history' in entry and entry['history']:
+                subject_str = entry['history'][0].get('subject')
+
+            if subject_str and role == 'op': 
+                rendered_elements.append(Padding(Markdown(f"**{subject_str.strip()}**"), (0,0,0, (indent * 4) + 2)))
+
+            # 3. Main Content (HTML to Markdown)
+            html_content_str = None
+            if role == 'op' and 'history' in entry and entry['history']:
+                html_content_str = entry['history'][0].get('content')
+            elif role in ['student', 'instructor']: 
+                html_content_str = entry.get('content') 
+                answer_subject = entry.get('subject')
+                if answer_subject: 
+                    html_content_str = f"<h3>{answer_subject}</h3>{html_content_str if html_content_str else ''}"
+            elif role == 'followup': 
+                html_content_str = entry.get('subject') 
+            elif role == 'comment': 
+                html_content_str = entry.get('subject') 
+            elif role == 'note': # Added content extraction for 'note'
+                html_content_str = entry.get('subject') # Notes usually have content in subject
             
             if html_content_str:
                 processed_html_content = ""
                 try:
-                    # Directly use h2t_converter as html_to_markdown lambda implies
-                    # Ensure h2t_converter is accessible in this scope (e.g. defined globally or passed)
-                    # For this example, assuming html_to_markdown is the user's defined lambda using h2t_converter
-                    raw_converted = html_to_markdown(html_content_str) 
+                    raw_converted = html_to_markdown(str(html_content_str)) 
                     if raw_converted is not None:
                         processed_html_content = str(raw_converted).strip()
                     else:
-                        processed_html_content = "[Content conversion resulted in None]"
+                        processed_html_content = "[Content conversion error: None returned]"
                 except Exception as e:
-                    # Consider logging the full exception 'e' for debugging purposes
-                    processed_html_content = f"[Error converting content: {type(e).__name__}]"
+                    processed_html_content = f"[Error converting content: {type(e).__name__} - {e}]"
                 
-                if processed_html_content: # Add if not empty
-                    if current_body_parts: # If subject was already added, add separator
-                        current_body_parts.append("\n\n" + processed_html_content)
-                    else:
-                        current_body_parts.append(processed_html_content)
-            
-            final_body_string = "".join(current_body_parts)
+                if processed_html_content: 
+                    rendered_elements.append(Padding(Markdown(processed_html_content), (0, 0, 0, (indent * 4) + 2)))
+            elif role == 'op' and not subject_str and ('history' not in entry or not entry['history'] or not entry['history'][0].get('content')):
+                 rendered_elements.append(Padding(Text("[Empty post content]", style="dim"), (0,0,0, (indent * 4) +2)))
 
-            if final_body_string.strip(): 
-                md = Markdown(final_body_string)
-                rendered_elements.append(Padding(md, (0, 0, 0, indent * 4)))
+            # 4. Endorsements
+            if 'tag_good_arr' in entry and entry['tag_good_arr']:
+                endorsers_display = []
+                for tag_info_item in entry['tag_good_arr']:
+                    if isinstance(tag_info_item, dict):
+                        endorser_name = tag_info_item.get('endorser_name', 'An endorser')
+                        endorser_role = f" ({tag_info_item.get('role', 'user')})" if tag_info_item.get('role') else ""
+                        endorsers_display.append(f"{endorser_name}{endorser_role}")
+                    elif isinstance(tag_info_item, str): # Handle case where tag_info_item is a string (e.g., user ID)
+                        endorsers_display.append(tag_info_item) # Display the string directly
+                    # else: could add handling for other unexpected types
+                if endorsers_display:
+                    endorsement_line = Text(f"~ Endorsed by: {', '.join(endorsers_display)} ~", style="italic yellow")
+                    rendered_elements.append(Padding(endorsement_line, (0,0,0, (indent * 4) + 4))) 
             
+            # 5. Poll Data (Basic Rendering)
+            if role == 'op' and entry.get('type') == 'poll':
+                poll_info_parts = [Text("[POLL]", style="bold cyan")]
+                poll_data = entry.get('poll') # Standard field for poll info in Piazza API
+                if poll_data and 'options' in poll_data and isinstance(poll_data['options'], list):
+                    options_map = {opt['id']: opt.get('text', 'Option') for opt in poll_data['options']}
+                    # Results are often in poll_data['results'] (map of option_id to votes)
+                    # or sometimes directly in options if votes are embedded.
+                    # Let's assume poll_data['results'] exists.
+                    results = poll_data.get('results', {}) 
+                    
+                    for opt_id, opt_text in options_map.items():
+                        votes = results.get(opt_id, 0)
+                        poll_info_parts.append(Text(f"\\n- {opt_text} ({votes} votes)", style="cyan"))
+                else:
+                    poll_info_parts.append(Text(" [Details not available or structure unexpected]", style="dim cyan"))
+                
+                rendered_elements.append(Padding(Text.assemble(*poll_info_parts), (0,0,0, (indent * 4)+2)))
+
+            if not rendered_elements and str(prefix): # Only prefix was rendered, add placeholder
+                 rendered_elements.append(Padding(Text("...", style="dim"), (0,0,0, (indent*4)+2)))
+            elif not rendered_elements and not str(prefix): # Absolutely nothing, render a minimal marker
+                 rendered_elements.append(Padding(Text("[empty entry]", style="dim"), (0,0,0, (indent*4)+2)))
+
+
             return rendered_elements
 
-        # Helper to recursively walk through children (replies/comments)
         def walk_children(children_data, current_indent):
             child_lines = []
             for child_item in children_data:
@@ -569,26 +657,32 @@ class PiazzaCLI(Cmd):
             # 1. Original Post
             output_lines.extend(render_entry(current_post_data, indent=0, role='op'))
 
-            # 2. Process all direct children: student answers, instructor answers, and followups
+            # 2. Process all direct children: student answers, instructor answers, followups, and notes
             children_of_post = current_post_data.get('children', [])
             if children_of_post:
                 for child_item in children_of_post:
                     item_type = child_item.get('type')
+                    role_to_render = None
                     
                     if item_type == 's_answer':
-                        output_lines.extend(render_entry(child_item, indent=1, role='student'))
-                        if child_item.get('children'): # Comments on student answer
-                            output_lines.extend(walk_children(child_item['children'], 2))
+                        role_to_render = 'student'
                     elif item_type == 'i_answer':
-                        output_lines.extend(render_entry(child_item, indent=1, role='instructor'))
-                        if child_item.get('children'): # Comments on instructor answer
-                            output_lines.extend(walk_children(child_item['children'], 2))
+                        role_to_render = 'instructor'
                     elif item_type == 'followup':
-                        output_lines.extend(render_entry(child_item, indent=1, role='followup'))
-                        # Followups can have their own children (comments on the followup)
+                        role_to_render = 'followup'
+                    elif item_type == 'note':
+                        role_to_render = 'note'
+                    else:
+                        # Fallback for unknown types: try rendering as a 'comment'
+                        # This helps catch other potential content if types are unexpected.
+                        # A debug print here would be useful: console.print(f"[DEBUG] Unknown child type: {item_type} in post {current_post_data.get('nr', 'N/A')}. Rendering as comment.")
+                        role_to_render = 'comment' 
+
+                    if role_to_render:
+                        output_lines.extend(render_entry(child_item, indent=1, role=role_to_render))
+                        # Recursively walk children of this item (comments on answers, followups, notes, etc.)
                         if child_item.get('children'): 
                             output_lines.extend(walk_children(child_item['children'], 2))
-                    # Add elif for other child types if necessary in the future
             return output_lines
 
         thread_lines = walk_thread(post)
