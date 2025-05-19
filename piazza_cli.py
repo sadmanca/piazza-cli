@@ -415,7 +415,7 @@ class PiazzaCLI(Cmd):
                 return
 
             # Generate embeddings for posts if not cached or cache is stale for embeddings
-            if not post_embeddings or len(post_embeddings) != len(post_texts_for_embedding):
+            if post_embeddings is None or len(post_embeddings) != len(post_texts_for_embedding):
                 with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console) as progress:
                     # Store TaskID
                     embeddings_task_id = progress.add_task(description=f"Generating embeddings for {len(post_texts_for_embedding)} posts...", total=None)
@@ -432,7 +432,7 @@ class PiazzaCLI(Cmd):
             query_embedding = self.sentence_model.encode(query, convert_to_tensor=True)
             
             # util.semantic_search returns a list of lists, each inner list contains dicts with 'corpus_id' and 'score'
-            search_hits = util.semantic_search(query_embedding, post_embeddings, top_k=10) # Get top 10 results
+            search_hits = util.semantic_search(query_embedding, post_embeddings, top_k=30) # Get top 10 results
             
             # search_hits is a list (for the single query) of lists of hits
             for hit in search_hits[0]: 
@@ -440,32 +440,112 @@ class PiazzaCLI(Cmd):
         else:
             # Fallback to simple keyword search if sentence_model is not available
             console.print(f"[yellow]Semantic search model not available. Falling back to simple keyword search for '{query}'...[/yellow]")
-            for post in all_posts:
-                search_text = post.get('subject', '') + " " + post.get('preview', {}).get('text', '')
+            # In fallback, ensure 'results' contains posts with 'nr' and 'subject' at least
+            temp_results = []
+            for post_data in all_posts:
+                search_text = post_data.get('subject', '') + " " + post_data.get('preview', {}).get('text', '')
                 if query.lower() in search_text.lower():
-                    results.append(post)
+                    temp_results.append(post_data)
+            results = temp_results # Ensure results are consistently structured
 
         if not results:
-            console.print(f"[yellow]No results found for '{query}' using semantic search.[/yellow]")
+            console.print(f"[yellow]No results found for '{query}'.[/yellow]")
             input("Press Enter to return...")
             return
 
-        post_labels = [f"[{p['nr']}] {p.get('subject', '')}" for p in results]
+        post_labels = []
+        post_label_map = []  # Map from label index to result index
+        SNIPPET_LENGTH = 70 # Target length for generic snippets from preview
+        CONTEXT_WINDOW = 35 # Characters around query for contextual snippets
+        MAX_DISPLAY_SNIPPET_LEN = 150 # Overall max length for a snippet line
+
+        with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"), transient=True, console=console) as progress_bar:
+            task_id = progress_bar.add_task(description="Generating snippets for search results...", total=len(results))
+            for i, p in enumerate(results):
+                subject = p.get('subject', 'No Subject')
+                post_nr = p.get('nr', 'N/A')
+                snippet_text = "[Snippet not available]"
+                try:
+                    # Fetch full post details for snippet generation
+                    full_post_details = net.get_post(p['nr']) 
+                    main_content_html = ""
+                    if full_post_details and full_post_details.get('history') and full_post_details['history']:
+                        main_content_html = full_post_details['history'][0].get('content', '')
+
+                    if main_content_html:
+                        full_content_md = html_to_markdown(main_content_html).strip()
+                        # Consolidate multiple newlines/spaces for easier processing and display
+                        full_content_md_oneline = ' '.join(full_content_md.split())
+
+                        if not full_content_md_oneline.strip():
+                            snippet_text = "[Post content is empty or whitespace]"
+                        else:
+                            query_lower = query.lower()
+                            content_lower = full_content_md_oneline.lower()
+                            query_index = content_lower.find(query_lower)
+                            
+                            if query_index != -1: # Query found, create contextual snippet
+                                start_idx = max(0, query_index - CONTEXT_WINDOW)
+                                end_idx = min(len(full_content_md_oneline), query_index + len(query) + CONTEXT_WINDOW)
+                                
+                                temp_snip = full_content_md_oneline[start_idx:end_idx]
+                                
+                                prefix = "..." if start_idx > 0 else ""
+                                suffix = "..." if end_idx < len(full_content_md_oneline) else ""
+                                snippet_text = prefix + temp_snip.strip() + suffix
+                            elif full_content_md_oneline: # Fallback to generic snippet from full content
+                                snippet_text = full_content_md_oneline[:SNIPPET_LENGTH*2]
+                                if len(full_content_md_oneline) > SNIPPET_LENGTH*2:
+                                    snippet_text = snippet_text + "..."
+                            # If full_content_md_oneline was empty, already handled
+                    
+                    # Fallback to original preview if full content processing didn't yield a good snippet
+                    elif p.get('preview', {}).get('html', ''):
+                        preview_html = p.get('preview', {}).get('html', '')
+                        fallback_snippet_html = html_to_markdown(preview_html).strip()
+                        fallback_snippet = ' '.join(fallback_snippet_html.split())
+                        if fallback_snippet:
+                            if len(fallback_snippet) > SNIPPET_LENGTH:
+                                snippet_text = fallback_snippet[:SNIPPET_LENGTH] + "..."
+                            else:
+                                snippet_text = fallback_snippet
+                        else:
+                             snippet_text = "[no preview available (from feed)]"
+                    else:
+                        snippet_text = "[no preview or full content available]"
+
+                except Exception: # Catchall for errors during get_post or snippet processing
+                    # You might want to log the exception e for debugging
+                    # For example: console.print(f"[dim red]Error generating snippet for post {post_nr}: {e}[/dim red]")
+                    snippet_text = "[Error generating snippet]"
+                
+                # Ensure snippet_text is not excessively long for display
+                if len(snippet_text) > MAX_DISPLAY_SNIPPET_LEN:
+                    snippet_text = snippet_text[:MAX_DISPLAY_SNIPPET_LEN-3] + "..."
+
+                # Two-line display: subject, then snippet (indented)
+                post_labels.append(f"{i + 1}) {subject}")
+                post_labels.append(f"        {snippet_text}")
+                post_label_map.append(i)  # Only map the subject line to the result index
+                progress_bar.update(task_id, advance=1)
+
         post_labels.append("Back")
 
         while True:
-            choice = questionary.select(f"Semantic search results in {course['name']}: ({len(results)} found)", choices=post_labels).ask()
+            choice = questionary.select(
+                f"Semantic search results in {course['name']}: ({len(results)} found)",
+                choices=post_labels
+            ).ask()
             if choice is None or choice == "Back":
                 break
-            # Ensure choice is one of the post labels before trying to get index
-            if choice in post_labels[:-1]: # Exclude "Back"
+            # Only allow selection on subject lines (odd indices)
+            try:
                 idx = post_labels.index(choice)
-                post_nr = results[idx]['nr']
-                self._show_post(post_nr, net)
-            elif choice == "Back":
-                break
-            # If choice is None (e.g., user pressed Esc), also break
-            else: # Should not happen with questionary.select if choice is None
+                if idx < len(post_label_map)*2 and idx % 2 == 0:
+                    result_idx = post_label_map[idx // 2]
+                    post_nr = results[result_idx]['nr']
+                    self._show_post(post_nr, net)
+            except Exception:
                 break
 
     def _question_list_view(self):
