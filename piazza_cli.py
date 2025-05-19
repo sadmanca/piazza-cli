@@ -305,35 +305,66 @@ class PiazzaCLI(Cmd):
             # Compose subject and content, convert HTML to Markdown
             body = ""
             if entry.get('subject'):
-                body += f"**{entry['subject']}**\n"
+                body += f"**{entry['subject']}**\n\n" # Add extra newline for separation
             content = entry.get('content', '')
             if content:
                 body += html_to_markdown(content)
-            # Render as Markdown, indented
-            md = Markdown(body)
-            # Indent using Align and Padding
+            
             from rich.padding import Padding
-            return Padding(Group(prefix, md), (0, 0, 0, indent * 4))
+            rendered_elements = []
+            
+            # Render prefix as a single line (Text)
+            if str(prefix):
+                rendered_elements.append(Padding(prefix, (0, 0, 0, indent * 4)))
+            
+            # Render Markdown body, allowing Rich to handle wrapping
+            # The Markdown object itself will be padded.
+            # The width of the console is implicitly handled by the Panel/Live display.
+            if body.strip(): # Only add Markdown if there's content
+                md = Markdown(body)
+                rendered_elements.append(Padding(md, (0, 0, 0, indent * 4)))
+            
+            return rendered_elements
+
+        def walk_children(children, indent):
+            lines = []
+            for child in children:
+                # Determine role
+                role = None
+                if child.get('type') == 'i_answer':
+                    role = 'instructor'
+                elif child.get('type') == 's_answer':
+                    role = 'student'
+                elif child.get('type') == 'feedback':
+                    role = 'comment'
+                # For answers, use their history[0] as entry
+                if 'history' in child and child['history']:
+                    lines.extend(render_entry(child['history'][0], indent, role))
+                else:
+                    lines.extend(render_entry(child, indent, role))
+                # Recursively walk children/comments
+                if 'children' in child and child['children']:
+                    lines.extend(walk_children(child['children'], indent + 1))
+            return lines
 
         def walk_thread(post):
             lines = []
+            # Main post
             main = post['history'][0]
-            lines.append(render_entry(main, 0, 'op'))
+            lines.extend(render_entry(main, 0, 'op'))
+            # Answers (instructor/student)
             if 'children' in post:
-                for child in post['children']:
-                    if child['type'] == 'i_answer':
-                        lines.append(render_entry(child['history'][0], 1, 'instructor'))
-                    elif child['type'] == 's_answer':
-                        lines.append(render_entry(child['history'][0], 1, 'student'))
+                lines.extend(walk_children(post['children'], 1))
+            # Followups and their comments
             if 'followups' in post:
                 for f in post['followups']:
-                    lines.append(render_entry(f, 1, 'followup'))
-                    if 'children' in f:
-                        for c in f['children']:
-                            lines.append(render_entry(c, 2, 'comment'))
+                    lines.extend(render_entry(f, 1, 'followup'))
+                    if 'children' in f and f['children']:
+                        lines.extend(walk_children(f['children'], 2))
             return lines
 
         thread_lines = walk_thread(post)
+        # Flatten all lines for scrolling, regardless of entry
         window_size = 12
         pos = 0
         total = len(thread_lines)
