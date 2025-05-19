@@ -16,9 +16,24 @@ from rich.align import Align
 from rich.console import Group
 from rich.live import Live
 import keyboard
+from rich.markdown import Markdown
+import re
 
 CRED_FILE = os.path.expanduser("~/.piazza_cli_creds.json")
 console = Console()
+
+try:
+    import html2text
+    _html2md = html2text.HTML2Text()
+    _html2md.ignore_links = False
+    _html2md.ignore_images = False
+    _html2md.body_width = 0
+    def html_to_markdown(html):
+        return _html2md.handle(html)
+except ImportError:
+    # Fallback: strip tags, no formatting
+    def html_to_markdown(html):
+        return re.sub('<[^<]+?>', '', html or '')
 
 class PiazzaCLI(Cmd):
     intro = "Welcome to Piazza CLI. Type help or ? to list commands."
@@ -287,12 +302,18 @@ class PiazzaCLI(Cmd):
                 prefix.append("[FOLLOWUP] ", style="yellow")
             elif role == 'comment':
                 prefix.append("[COMMENT] ", style="dim")
-            body = entry.get('subject', '') + "\n" if entry.get('subject') else ""
-            body += entry.get('content', '')
-            text = Text(" " * (indent * 4))
-            text.append(prefix)
-            text.append(body, style="white")
-            return text
+            # Compose subject and content, convert HTML to Markdown
+            body = ""
+            if entry.get('subject'):
+                body += f"**{entry['subject']}**\n"
+            content = entry.get('content', '')
+            if content:
+                body += html_to_markdown(content)
+            # Render as Markdown, indented
+            md = Markdown(body)
+            # Indent using Align and Padding
+            from rich.padding import Padding
+            return Padding(Group(prefix, md), (0, 0, 0, indent * 4))
 
         def walk_thread(post):
             lines = []
